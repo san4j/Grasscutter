@@ -1,17 +1,37 @@
 package emu.grasscutter;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOError;
-import java.net.InetSocketAddress;
-import java.util.Calendar;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import com.google.gson.Gson;
 
+import emu.grasscutter.auth.AuthenticationSystem;
+import emu.grasscutter.auth.DefaultAuthentication;
 import emu.grasscutter.command.CommandMap;
+import emu.grasscutter.command.DefaultPermissionHandler;
+import emu.grasscutter.command.PermissionHandler;
+import emu.grasscutter.config.ConfigContainer;
+import emu.grasscutter.data.ResourceLoader;
+import emu.grasscutter.database.DatabaseManager;
 import emu.grasscutter.plugin.PluginManager;
 import emu.grasscutter.plugin.api.ServerHook;
 import emu.grasscutter.scripts.ScriptLoader;
+import emu.grasscutter.server.game.GameServer;
+import emu.grasscutter.server.http.HttpServer;
+import emu.grasscutter.server.http.dispatch.DispatchHandler;
+import emu.grasscutter.server.http.dispatch.RegionHandler;
+import emu.grasscutter.server.http.documentation.DocumentationServerHandler;
+import emu.grasscutter.server.http.handlers.AnnouncementsHandler;
+import emu.grasscutter.server.http.handlers.GachaHandler;
+import emu.grasscutter.server.http.handlers.GenericHandler;
+import emu.grasscutter.server.http.handlers.LogHandler;
+import emu.grasscutter.tools.Tools;
+import emu.grasscutter.utils.Crypto;
+import emu.grasscutter.utils.JsonUtils;
+import emu.grasscutter.utils.Language;
+import emu.grasscutter.utils.StartupArguments;
 import emu.grasscutter.utils.Utils;
+import lombok.Getter;
+import lombok.Setter;
 import org.jline.reader.EndOfFileException;
 import org.jline.reader.LineReader;
 import org.jline.reader.LineReaderBuilder;
@@ -21,258 +41,338 @@ import org.jline.terminal.TerminalBuilder;
 import org.reflections.Reflections;
 import org.slf4j.LoggerFactory;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import javax.annotation.Nullable;
+import java.io.*;
+import java.util.Calendar;
 
-import ch.qos.logback.classic.Logger;
-import emu.grasscutter.data.ResourceLoader;
-import emu.grasscutter.database.DatabaseManager;
-import emu.grasscutter.server.dispatch.DispatchServer;
-import emu.grasscutter.server.game.GameServer;
-import emu.grasscutter.tools.Tools;
-import emu.grasscutter.utils.Crypto;
+import static emu.grasscutter.config.Configuration.DATA;
+import static emu.grasscutter.config.Configuration.SERVER;
+import static emu.grasscutter.utils.Language.translate;
 
 public final class Grasscutter {
-	private static final Logger log = (Logger) LoggerFactory.getLogger(Grasscutter.class);
-	private static Config config;
-	private static LineReader consoleLineReader = null;
-	private static Language language;
+    private static final Logger log = (Logger) LoggerFactory.getLogger(Grasscutter.class);
+    private static LineReader consoleLineReader = null;
 
-	private static final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-	private static final File configFile = new File("./config.json");
-	
-	private static int day; // Current day of week
-	
-	private static DispatchServer dispatchServer;
-	private static GameServer gameServer;
-	private static PluginManager pluginManager;
-	
-	public static final Reflections reflector = new Reflections("emu.grasscutter");
-	
-	static {
-		// Declare logback configuration.
-		System.setProperty("logback.configurationFile", "src/main/resources/logback.xml");
-		
-		// Load server configuration.
-		Grasscutter.loadConfig();
+    private static Language language;
 
-		// Load Language
-		Grasscutter.loadLanguage();
-		
-		// Check server structure.
-		Utils.startupCheck();
-	}
-	
-    public static void main(String[] args) throws Exception {
-    	Crypto.loadKeys();
-    	
-		for (String arg : args) {
-			switch (arg.toLowerCase()) {
-				case "-handbook" -> {
-					Tools.createGmHandbook(); return;
-				}
-				case "-gachamap" -> {
-					Tools.createGachaMapping(); return;
-				}
-			}
-		}
-		
-		// Initialize server.
-		Grasscutter.getLogger().info(language.Starting_Grasscutter);
-		
-		// Load all resources.
-		Grasscutter.updateDayOfWeek();
-		ResourceLoader.loadAll();
-		ScriptLoader.init();
-		
-		// Database
-		DatabaseManager.initialize();
+    public static final File configFile = new File("./config.json");
 
-		// Create plugin manager instance.
-		pluginManager = new PluginManager();
-		
-		// Create server instances.
-		dispatchServer = new DispatchServer();
-		gameServer = new GameServer(new InetSocketAddress(getConfig().getGameServerOptions().Ip, getConfig().getGameServerOptions().Port));
-		// Create a server hook instance with both servers.
-		new ServerHook(gameServer, dispatchServer);
-		
-		// Start servers.
-		if (getConfig().RunMode == ServerRunMode.HYBRID) {
-			dispatchServer.start();
-			gameServer.start();
-		} else if (getConfig().RunMode == ServerRunMode.DISPATCH_ONLY) {
-			dispatchServer.start();
-		} else if (getConfig().RunMode == ServerRunMode.GAME_ONLY) {
-			gameServer.start();
-		} else {
-			getLogger().error(language.Invalid_server_run_mode + " " + getConfig().RunMode);
-			getLogger().error(language.Server_run_mode);
-			getLogger().error(language.Shutting_down);
-			System.exit(1);
-		}
-		
-		// Enable all plugins.
-		pluginManager.enablePlugins();
+    private static int day; // Current day of week.
+    @Getter @Setter private static String preferredLanguage;
 
-		// Hook into shutdown event.
-		Runtime.getRuntime().addShutdownHook(new Thread(Grasscutter::onShutdown));
+    private static HttpServer httpServer;
+    private static GameServer gameServer;
+    private static PluginManager pluginManager;
+    @Getter private static CommandMap commandMap;
 
-		// Open console.
-		startConsole();
+    private static AuthenticationSystem authenticationSystem;
+    private static PermissionHandler permissionHandler;
+
+    public static final Reflections reflector = new Reflections("emu.grasscutter");
+    public static ConfigContainer config;
+
+    static {
+        // Declare logback configuration.
+        System.setProperty("logback.configurationFile", "src/main/resources/logback.xml");
+
+        // Disable the MongoDB logger.
+        var mongoLogger = (Logger) LoggerFactory.getLogger("org.mongodb.driver");
+        mongoLogger.setLevel(Level.OFF);
+
+        // Load server configuration.
+        Grasscutter.loadConfig();
+        // Attempt to update configuration.
+        ConfigContainer.updateConfig();
+
+        // Load translation files.
+        Grasscutter.loadLanguage();
+
+        // Check server structure.
+        Utils.startupCheck();
     }
 
-	/**
-	 * Server shutdown event.
-	 */
-	private static void onShutdown() {
-		// Disable all plugins.
-		pluginManager.disablePlugins();
-	}
+    public static void main(String[] args) throws Exception {
+        Crypto.loadKeys(); // Load keys from buffers.
 
-	public static void loadConfig() {
-		try (FileReader file = new FileReader(configFile)) {
-			config = gson.fromJson(file, Config.class);
-			saveConfig();
-		} catch (Exception e) {
-			Grasscutter.config = new Config(); 
-			saveConfig();
-		}
-	}
+        // Parse start-up arguments.
+        if (StartupArguments.parse(args)) {
+            System.exit(0); // Exit early.
+        }
 
-	public static void loadLanguage() {
-		try (FileReader file = new FileReader(String.format(getConfig().LANGUAGE_FOLDER + "%s.json", Grasscutter.config.Language))) {
-			language = gson.fromJson(file, Language.class);
-		} catch (Exception e) {
-			Grasscutter.language = new Language();
-			Grasscutter.config.Language = "en_us";
-			saveConfig();
+        // Create command map.
+        commandMap = new CommandMap(true);
+        // Generate handbooks.
+        Tools.createGmHandbooks();
 
-			try {
-				File folder = new File("./language");
-				if (!folder.exists() && !folder.isDirectory()) {
-					//noinspection ResultOfMethodCallIgnored
-					folder.mkdirs();
-				}
-			} catch (Exception ee) {
-				Grasscutter.getLogger().error("Unable to create language folder.");
-			}
-			try (FileWriter file = new FileWriter("./language/en_us.json")) {
-				file.write(gson.toJson(language));
-			} catch (Exception ee) {
-				Grasscutter.getLogger().error("Unable to create language file.");
-			}
-		}
-	}
-	
-	public static void saveConfig() {
-		try (FileWriter file = new FileWriter(configFile)) {
-			file.write(gson.toJson(config));
-		} catch (Exception e) {
-			Grasscutter.getLogger().error("Unable to save config file.");
-		}
-	}
-	
-	public static void startConsole() {
-		// Console should not start in dispatch only mode.
-		if (getConfig().RunMode == ServerRunMode.DISPATCH_ONLY) {
-			getLogger().info(language.Dispatch_mode_not_support_command);
-			return;
-		}
+        // Initialize server.
+        Grasscutter.getLogger().info(translate("messages.status.starting"));
+        Grasscutter.getLogger().info(translate("messages.status.game_version", GameConstants.VERSION));
+        Grasscutter.getLogger().info(translate("messages.status.version", BuildConfig.VERSION, BuildConfig.GIT_HASH));
 
-		getLogger().info(language.Start_done);
-		String input = null;
-		boolean isLastInterrupted = false;
-		while (true) {
-			try {
-				input = consoleLineReader.readLine("> ");
-			} catch (UserInterruptException e) {
-				if (!isLastInterrupted) {
-					isLastInterrupted = true;
-					Grasscutter.getLogger().info("Press Ctrl-C again to shutdown.");
-					continue;
-				} else {
-					Runtime.getRuntime().exit(0);
-				}
-			} catch (EndOfFileException e) {
-				Grasscutter.getLogger().info("EOF detected.");
-				continue;
-			} catch (IOError e) {
-				Grasscutter.getLogger().error("An IO error occurred.", e);
-				continue;
-			}
+        // Load all resources.
+        Grasscutter.updateDayOfWeek();
+        ResourceLoader.loadAll();
+        ScriptLoader.init();
 
-			isLastInterrupted = false;
-			try {
-				CommandMap.getInstance().invoke(null, input);
-			} catch (Exception e) {
-				Grasscutter.getLogger().error(language.Command_error, e);
-			}
-		}
-	}
+        // Initialize database.
+        DatabaseManager.initialize();
 
-	public static Config getConfig() {
-		return config;
-	}
+        // Initialize the default systems.
+        authenticationSystem = new DefaultAuthentication();
+        permissionHandler = new DefaultPermissionHandler();
 
-	public static Language getLanguage() {
-		return language;
-	}
+        // Create server instances.
+        httpServer = new HttpServer();
+        gameServer = new GameServer();
+        // Create a server hook instance with both servers.
+        new ServerHook(gameServer, httpServer);
 
-	public static Logger getLogger() {
-		return log;
-	}
+        // Create plugin manager instance.
+        pluginManager = new PluginManager();
+        // Add HTTP routes after loading plugins.
+        httpServer.addRouter(HttpServer.UnhandledRequestRouter.class);
+        httpServer.addRouter(HttpServer.DefaultRequestRouter.class);
+        httpServer.addRouter(RegionHandler.class);
+        httpServer.addRouter(LogHandler.class);
+        httpServer.addRouter(GenericHandler.class);
+        httpServer.addRouter(AnnouncementsHandler.class);
+        httpServer.addRouter(DispatchHandler.class);
+        httpServer.addRouter(GachaHandler.class);
+        httpServer.addRouter(DocumentationServerHandler.class);
 
-	public static LineReader getConsole() {
-		if (consoleLineReader == null) {
-			Terminal terminal = null;
-			try {
-				terminal = TerminalBuilder.builder().jna(true).build();
-			} catch (Exception e) {
-				try {
-					// Fallback to a dumb jline terminal.
-					terminal = TerminalBuilder.builder().dumb(true).build();
-				} catch (Exception ignored) {
-					// When dumb is true, build() never throws.
-				}
-			}
-			consoleLineReader = LineReaderBuilder.builder()
-					.terminal(terminal)
-					.build();
-		}
-		return consoleLineReader;
-	}
+        // Start servers.
+        var runMode = SERVER.runMode;
+        if (runMode == ServerRunMode.HYBRID) {
+            httpServer.start();
+            gameServer.start();
+        } else if (runMode == ServerRunMode.DISPATCH_ONLY) {
+            httpServer.start();
+        } else if (runMode == ServerRunMode.GAME_ONLY) {
+            gameServer.start();
+        } else {
+            getLogger().error(translate("messages.status.run_mode_error", runMode));
+            getLogger().error(translate("messages.status.run_mode_help"));
+            getLogger().error(translate("messages.status.shutdown"));
+            System.exit(1);
+        }
 
-	public static Gson getGsonFactory() {
-		return gson;
-	}
+        // Enable all plugins.
+        pluginManager.enablePlugins();
 
-	public static DispatchServer getDispatchServer() {
-		return dispatchServer;
-	}
+        // Hook into shutdown event.
+        Runtime.getRuntime().addShutdownHook(new Thread(Grasscutter::onShutdown));
 
-	public static GameServer getGameServer() {
-		return gameServer;
-	}
-	
-	public static PluginManager getPluginManager() {
-		return pluginManager;
-	}
-	
-	public static void updateDayOfWeek() {
-		Calendar calendar = Calendar.getInstance();
-		day = calendar.get(Calendar.DAY_OF_WEEK); 
-	}
+        // Open console.
+        startConsole();
+    }
 
-	public static int getCurrentDayOfWeek() {
-		return day;
-	}
-	
-	public enum ServerRunMode {
-		HYBRID, DISPATCH_ONLY, GAME_ONLY
-	}
-	
-	public enum ServerDebugMode {
-		ALL, MISSING, NONE
-	}
+    /**
+     * Server shutdown event.
+     */
+    private static void onShutdown() {
+        // Disable all plugins.
+        if (pluginManager != null)
+            pluginManager.disablePlugins();
+    }
+
+    /*
+     * Methods for the language system component.
+     */
+
+    public static void loadLanguage() {
+        var locale = config.language.language;
+        language = Language.getLanguage(Utils.getLanguageCode(locale));
+    }
+
+    /*
+     * Methods for the configuration system component.
+     */
+
+    /**
+     * Attempts to load the configuration from a file.
+     */
+    public static void loadConfig() {
+        // Check if config.json exists. If not, we generate a new config.
+        if (!configFile.exists()) {
+            getLogger().info("config.json could not be found. Generating a default configuration ...");
+            config = new ConfigContainer();
+            Grasscutter.saveConfig(config);
+            return;
+        }
+
+        // If the file already exists, we attempt to load it.
+        try {
+            config = JsonUtils.loadToClass(configFile.getPath(), ConfigContainer.class);
+        } catch (Exception exception) {
+            getLogger().error("There was an error while trying to load the configuration from config.json. Please make sure that there are no syntax errors. If you want to start with a default configuration, delete your existing config.json.");
+            System.exit(1);
+        }
+    }
+
+    /**
+     * Saves the provided server configuration.
+     *
+     * @param config The configuration to save, or null for a new one.
+     */
+    public static void saveConfig(@Nullable ConfigContainer config) {
+        if (config == null) config = new ConfigContainer();
+
+        try (FileWriter file = new FileWriter(configFile)) {
+            file.write(JsonUtils.encode(config));
+        } catch (IOException ignored) {
+            Grasscutter.getLogger().error("Unable to write to config file.");
+        } catch (Exception e) {
+            Grasscutter.getLogger().error("Unable to save config file.", e);
+        }
+    }
+
+    /*
+     * Getters for the various server components.
+     */
+
+    public static ConfigContainer getConfig() {
+        return config;
+    }
+
+    public static Language getLanguage() {
+        return language;
+    }
+
+    public static void setLanguage(Language language) {
+        Grasscutter.language = language;
+    }
+
+    public static Language getLanguage(String langCode) {
+        return Language.getLanguage(langCode);
+    }
+
+    public static Logger getLogger() {
+        return log;
+    }
+
+    public static LineReader getConsole() {
+        if (consoleLineReader == null) {
+            Terminal terminal = null;
+            try {
+                terminal = TerminalBuilder.builder().jna(true).build();
+            } catch (Exception e) {
+                try {
+                    // Fallback to a dumb jline terminal.
+                    terminal = TerminalBuilder.builder().dumb(true).build();
+                } catch (Exception ignored) {
+                    // When dumb is true, build() never throws.
+                }
+            }
+            consoleLineReader = LineReaderBuilder.builder()
+                .terminal(terminal)
+                .build();
+        }
+        return consoleLineReader;
+    }
+
+    @Deprecated(forRemoval = true)
+    public static Gson getGsonFactory() {
+        return JsonUtils.getGsonFactory();
+    }
+
+    public static HttpServer getHttpServer() {
+        return httpServer;
+    }
+
+    public static GameServer getGameServer() {
+        return gameServer;
+    }
+
+    public static PluginManager getPluginManager() {
+        return pluginManager;
+    }
+
+    public static AuthenticationSystem getAuthenticationSystem() {
+        return authenticationSystem;
+    }
+
+    public static PermissionHandler getPermissionHandler() {
+        return permissionHandler;
+    }
+
+    public static int getCurrentDayOfWeek() {
+        return day;
+    }
+
+    /*
+     * Utility methods.
+     */
+
+    public static void updateDayOfWeek() {
+        Calendar calendar = Calendar.getInstance();
+        day = calendar.get(Calendar.DAY_OF_WEEK);
+    }
+
+    public static void startConsole() {
+        // Console should not start in dispatch only mode.
+        if (SERVER.runMode == ServerRunMode.DISPATCH_ONLY) {
+            getLogger().info(translate("messages.dispatch.no_commands_error"));
+            return;
+        }
+
+        getLogger().info(translate("messages.status.done"));
+        String input = null;
+        boolean isLastInterrupted = false;
+        while (config.server.game.enableConsole) {
+            try {
+                input = consoleLineReader.readLine("> ");
+            } catch (UserInterruptException e) {
+                if (!isLastInterrupted) {
+                    isLastInterrupted = true;
+                    Grasscutter.getLogger().info("Press Ctrl-C again to shutdown.");
+                    continue;
+                } else {
+                    Runtime.getRuntime().exit(0);
+                }
+            } catch (EndOfFileException e) {
+                Grasscutter.getLogger().info("EOF detected.");
+                continue;
+            } catch (IOError e) {
+                Grasscutter.getLogger().error("An IO error occurred.", e);
+                continue;
+            }
+
+            isLastInterrupted = false;
+            try {
+                CommandMap.getInstance().invoke(null, null, input);
+            } catch (Exception e) {
+                Grasscutter.getLogger().error(translate("messages.game.command_error"), e);
+            }
+        }
+    }
+
+    /**
+     * Sets the authentication system for the server.
+     *
+     * @param authenticationSystem The authentication system to use.
+     */
+    public static void setAuthenticationSystem(AuthenticationSystem authenticationSystem) {
+        Grasscutter.authenticationSystem = authenticationSystem;
+    }
+
+    /**
+     * Sets the permission handler for the server.
+     *
+     * @param permissionHandler The permission handler to use.
+     */
+    public static void setPermissionHandler(PermissionHandler permissionHandler) {
+        Grasscutter.permissionHandler = permissionHandler;
+    }
+
+    /*
+     * Enums for the configuration.
+     */
+
+    public enum ServerRunMode {
+        HYBRID, DISPATCH_ONLY, GAME_ONLY
+    }
+
+    public enum ServerDebugMode {
+        ALL, MISSING, WHITELIST, BLACKLIST, NONE
+    }
 }

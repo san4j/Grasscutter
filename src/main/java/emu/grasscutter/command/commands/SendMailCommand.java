@@ -10,8 +10,14 @@ import emu.grasscutter.game.player.Player;
 import java.util.HashMap;
 import java.util.List;
 
-@Command(label = "sendmail", usage = "sendmail <userId|all|help> [templateId]",
-        description = "Sends mail to the specified user. The usage of this command changes based on it's composition state.", permission = "server.sendmail")
+import static emu.grasscutter.utils.Language.translate;
+
+@SuppressWarnings("ConstantConditions")
+@Command(
+    label = "sendMail",
+    usage = {"(<userId>|all) [<templateId>]", "help"},
+    permission = "server.sendmail",
+    targetRequirement = Command.TargetRequirement.NONE)
 public final class SendMailCommand implements CommandHandler {
 
     // TODO: You should be able to do /sendmail and then just send subsequent messages until you finish
@@ -23,9 +29,9 @@ public final class SendMailCommand implements CommandHandler {
 
     // Yes this is awful and I hate it.
     @Override
-    public void execute(Player sender, List<String> args) {
+    public void execute(Player sender, Player targetPlayer, List<String> args) {
         int senderId;
-        if(sender != null) {
+        if (sender != null) {
             senderId = sender.getUid();
         } else {
             senderId = -1;
@@ -37,24 +43,24 @@ public final class SendMailCommand implements CommandHandler {
                     MailBuilder mailBuilder;
                     switch (args.get(0).toLowerCase()) {
                         case "help" -> {
-                            CommandHandler.sendMessage(sender, this.getClass().getAnnotation(Command.class).description() + "\nUsage: " + this.getClass().getAnnotation(Command.class).usage());
+                            sendUsageMessage(sender);
                             return;
                         }
                         case "all" -> mailBuilder = new MailBuilder(true, new Mail());
                         default -> {
-                            if (DatabaseHelper.getPlayerById(Integer.parseInt(args.get(0))) != null) {
+                            if (DatabaseHelper.getPlayerByUid(Integer.parseInt(args.get(0))) != null) {
                                 mailBuilder = new MailBuilder(Integer.parseInt(args.get(0)), new Mail());
                             } else {
-                                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_user_not_exist, args.get(0)));
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.user_not_exist", args.get(0)));
                                 return;
                             }
                         }
                     }
                     mailBeingConstructed.put(senderId, mailBuilder);
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SendMail_start_composition);
+                    CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.start_composition"));
                 }
-                case 2 -> CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SendMail_templates);
-                default -> CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SendMail_invalid_arguments);
+                case 2 -> CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.templates"));
+                default -> CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.invalid_arguments"));
             }
         } else {
             MailBuilder mailBuilder = mailBeingConstructed.get(senderId);
@@ -63,28 +69,28 @@ public final class SendMailCommand implements CommandHandler {
                 switch (args.get(0).toLowerCase()) {
                     case "stop" -> {
                         mailBeingConstructed.remove(senderId);
-                        CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SendMail_send_cancel);
+                        CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.send_cancel"));
                         return;
                     }
                     case "finish" -> {
                         if (mailBuilder.constructionStage == 3) {
                             if (!mailBuilder.sendToAll) {
                                 Grasscutter.getGameServer().getPlayerByUid(mailBuilder.recipient, true).sendMail(mailBuilder.mail);
-                                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_send_done, mailBuilder.recipient));
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.send_done", mailBuilder.recipient));
                             } else {
                                 for (Player player : DatabaseHelper.getAllPlayers()) {
                                     Grasscutter.getGameServer().getPlayerByUid(player.getUid(), true).sendMail(mailBuilder.mail);
                                 }
-                                CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SendMail_send_all_done);
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.send_all_done"));
                             }
                             mailBeingConstructed.remove(senderId);
                         } else {
-                            CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_not_composition_end, getConstructionArgs(mailBuilder.constructionStage)));
+                            CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.not_composition_end", getConstructionArgs(mailBuilder.constructionStage, sender)));
                         }
                         return;
                     }
                     case "help" -> {
-                        CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_Please_use, getConstructionArgs(mailBuilder.constructionStage)));
+                        CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.please_use", getConstructionArgs(mailBuilder.constructionStage, sender)));
                         return;
                     }
                     default -> {
@@ -92,89 +98,81 @@ public final class SendMailCommand implements CommandHandler {
                             case 0 -> {
                                 String title = String.join(" ", args.subList(0, args.size()));
                                 mailBuilder.mail.mailContent.title = title;
-                                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_set_title, title));
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.set_title", title));
                                 mailBuilder.constructionStage++;
                             }
                             case 1 -> {
                                 String contents = String.join(" ", args.subList(0, args.size()));
                                 mailBuilder.mail.mailContent.content = contents;
-                                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_set_contents, contents));
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.set_contents", contents));
                                 mailBuilder.constructionStage++;
                             }
                             case 2 -> {
                                 String msgSender = String.join(" ", args.subList(0, args.size()));
                                 mailBuilder.mail.mailContent.sender = msgSender;
-                                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_set_message_sender, msgSender));
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.set_message_sender", msgSender));
                                 mailBuilder.constructionStage++;
                             }
                             case 3 -> {
-                                // Literally just copy-pasted from the give command lol.
-                                int item, lvl, amount = 1;
+                                int item;
+                                int lvl = 1;
+                                int amount = 1;
+                                int refinement = 0;
                                 switch (args.size()) {
-                                    default -> { // *No args*
-                                        CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SendMail_usage);
-                                        return;
-                                    }
-                                    case 1 -> { // <itemId|itemName>
+                                    case 4: // <itemId|itemName> [amount] [level] [refinement] // TODO: this requires Mail support but there's no harm leaving it here for now
                                         try {
-                                            item = Integer.parseInt(args.get(0));
-                                            lvl = 1;
+                                            refinement = Integer.parseInt(args.get(3));
                                         } catch (NumberFormatException ignored) {
-                                            // TODO: Parse from item name using GM Handbook.
-                                            CommandHandler.sendMessage(sender, Grasscutter.getLanguage().Invalid_item_id);
+                                            CommandHandler.sendMessage(sender, translate(sender, "commands.generic.invalid.itemRefinement"));
                                             return;
-                                        }
-                                    }
-                                    case 2 -> { // <itemId|itemName> [amount]
-                                        lvl = 1;
-                                        item = Integer.parseInt(args.get(0));
-                                        amount = Integer.parseInt(args.get(1));
-                                    }
-                                    case 3 -> { // <itemId|itemName> [amount] [level]
+                                        }  // Fallthrough
+                                    case 3: // <itemId|itemName> [amount] [level]
                                         try {
-                                            item = Integer.parseInt(args.get(0));
-                                            amount = Integer.parseInt(args.get(1));
                                             lvl = Integer.parseInt(args.get(2));
-
+                                        } catch (NumberFormatException ignored) {
+                                            CommandHandler.sendMessage(sender, translate(sender, "commands.generic.invalid.itemLevel"));
+                                            return;
+                                        }  // Fallthrough
+                                    case 2: // <itemId|itemName> [amount]
+                                        try {
+                                            amount = Integer.parseInt(args.get(1));
+                                        } catch (NumberFormatException ignored) {
+                                            CommandHandler.sendMessage(sender, translate(sender, "commands.generic.invalid.amount"));
+                                            return;
+                                        }  // Fallthrough
+                                    case 1: // <itemId|itemName>
+                                        try {
+                                            item = Integer.parseInt(args.get(0));
                                         } catch (NumberFormatException ignored) {
                                             // TODO: Parse from item name using GM Handbook.
-                                            CommandHandler.sendMessage(sender, Grasscutter.getLanguage().Invalid_item_or_player_id);
+                                            CommandHandler.sendMessage(sender, translate(sender, "commands.generic.invalid.itemId"));
                                             return;
                                         }
-                                    }
+                                        break;
+                                    default: // *No args*
+                                        CommandHandler.sendTranslatedMessage(sender, "commands.sendMail.give_usage");
+                                        return;
                                 }
                                 mailBuilder.mail.itemList.add(new Mail.MailItem(item, amount, lvl));
-                                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_send, amount, item, lvl));
+                                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.send", amount, item, lvl));
                             }
                         }
                     }
                 }
             } else {
-                CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SendMail_invalid_arguments_please_use, getConstructionArgs(mailBuilder.constructionStage)));
+                CommandHandler.sendMessage(sender, translate(sender, "commands.sendMail.invalid_arguments_please_use", getConstructionArgs(mailBuilder.constructionStage, sender)));
             }
         }
     }
 
-    private String getConstructionArgs(int stage) {
-        switch (stage) {
-            case 0 -> {
-                return Grasscutter.getLanguage().SendMail_title;
-            }
-            case 1 -> {
-                return Grasscutter.getLanguage().SendMail_message;
-            }
-            case 2 -> {
-                return Grasscutter.getLanguage().SendMail_sender;
-
-            }
-            case 3 -> {
-                return Grasscutter.getLanguage().SendMail_arguments;
-            }
-            default -> {
-                Thread.dumpStack();
-                return String.format(Grasscutter.getLanguage().SendMail_error, stage);
-            }
-        }
+    private String getConstructionArgs(int stage, Player sender) {
+        return switch (stage) {
+            case 0 -> translate(sender, "commands.sendMail.title");
+            case 1 -> translate(sender, "commands.sendMail.message");
+            case 2 -> translate(sender, "commands.sendMail.sender");
+            case 3 -> translate(sender, "commands.sendMail.arguments");
+            default -> translate(sender, "commands.sendMail.error", stage);
+        };
     }
 
     public static class MailBuilder {

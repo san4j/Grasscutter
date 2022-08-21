@@ -1,252 +1,180 @@
 package emu.grasscutter.command.commands;
 
-import emu.grasscutter.Grasscutter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 import emu.grasscutter.command.Command;
 import emu.grasscutter.command.CommandHandler;
+import emu.grasscutter.game.avatar.Avatar;
 import emu.grasscutter.game.entity.EntityAvatar;
 import emu.grasscutter.game.player.Player;
 import emu.grasscutter.game.props.FightProperty;
 import emu.grasscutter.server.packet.send.PacketEntityFightPropUpdateNotify;
 
-import java.util.List;
-
-@Command(label = "setstats", usage = "setstats|stats <stat> <value>",
-        description = "Set fight property for your current active character", aliases = {"stats"}, permission = "player.setstats")
+@Command(
+    label = "setStats",
+    aliases = {"stats", "stat"},
+    usage = {
+        "[set] <stat> <value>",
+        "(lock|freeze) <stat> [<value>]",  // Can lock to current value
+        "(unlock|unfreeze) <stat>"},
+    permission = "player.setstats",
+    permissionTargeted = "player.setstats.others")
 public final class SetStatsCommand implements CommandHandler {
+    private static class Stat {
+        String name;
+        FightProperty prop;
+
+        public Stat(FightProperty prop) {
+            this.name = prop.toString();
+            this.prop = prop;
+        }
+
+        public Stat(String name, FightProperty prop) {
+            this.name = name;
+            this.prop = prop;
+        }
+    }
+
+    private static enum Action {
+        ACTION_SET("commands.generic.set_to", "commands.generic.set_for_to"),
+        ACTION_LOCK("commands.setStats.locked_to", "commands.setStats.locked_for_to"),
+        ACTION_UNLOCK("commands.setStats.unlocked", "commands.setStats.unlocked_for");
+        public final String messageKeySelf;
+        public final String messageKeyOther;
+        private Action(String messageKeySelf, String messageKeyOther) {
+            this.messageKeySelf = messageKeySelf;
+            this.messageKeyOther = messageKeyOther;
+        }
+    }
+
+    private Map<String, Stat> stats;
+
+    public SetStatsCommand() {
+        this.stats = new HashMap<>();
+        for (String key : FightProperty.getShortNames()) {
+            this.stats.put(key, new Stat(FightProperty.getPropByShortName(key)));
+        }
+        // Full FightProperty enum that won't be advertised but can be used by devs
+        // They have a prefix to avoid the "hp" clash
+        for (FightProperty prop : FightProperty.values()) {
+            String name = prop.toString().substring(10);  // FIGHT_PROP_BASE_HP -> _BASE_HP
+            String key = name.toLowerCase();  // _BASE_HP -> _base_hp
+            name = name.substring(1);  // _BASE_HP -> BASE_HP
+            this.stats.put(key, new Stat(name, prop));
+        }
+
+        // Compatibility aliases
+        this.stats.put("mhp", this.stats.get("maxhp"));
+        this.stats.put("hp", new Stat(FightProperty.FIGHT_PROP_CUR_HP));  // Overrides FIGHT_PROP_HP
+        this.stats.put("atk", new Stat(FightProperty.FIGHT_PROP_CUR_ATTACK));  // Overrides FIGHT_PROP_ATTACK
+        this.stats.put("atkb", new Stat(FightProperty.FIGHT_PROP_BASE_ATTACK));  // This doesn't seem to get used to recalculate ATK, so it's only useful for stuff like Bennett's buff.
+        this.stats.put("eanemo", this.stats.get("anemo%"));
+        this.stats.put("ecryo", this.stats.get("cryo%"));
+        this.stats.put("edendro", this.stats.get("dendro%"));
+        this.stats.put("edend", this.stats.get("dendro%"));
+        this.stats.put("eelectro", this.stats.get("electro%"));
+        this.stats.put("eelec", this.stats.get("electro%"));
+        this.stats.put("ethunder", this.stats.get("electro%"));
+        this.stats.put("egeo", this.stats.get("geo%"));
+        this.stats.put("ehydro", this.stats.get("hydro%"));
+        this.stats.put("epyro", this.stats.get("pyro%"));
+        this.stats.put("ephys", this.stats.get("phys%"));
+    }
+
+    public static float parsePercent(String input) throws NumberFormatException {
+        if (input.endsWith("%")) {
+            return Float.parseFloat(input.substring(0, input.length()-1))/100f;
+        } else {
+            return Float.parseFloat(input);
+        }
+    }
 
     @Override
-    public void execute(Player sender, List<String> args) {
-        if (sender == null) {
-            CommandHandler.sendMessage(null, Grasscutter.getLanguage().Run_this_command_in_game);
+    public void execute(Player sender, Player targetPlayer, List<String> args) {
+        String statStr = null;
+        String valueStr;
+        float value = 0f;
+
+        if (args.size() < 2) {
+            sendUsageMessage(sender);
             return;
         }
 
-        if (args.size() < 2){
-            CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_usage);
+        // Get the action and stat
+        String arg0 = args.remove(0).toLowerCase();
+        Action action = switch (arg0) {
+            default -> {statStr = arg0; yield Action.ACTION_SET;}  // Implicit set command
+            case "set" -> Action.ACTION_SET;  // Explicit set command
+            case "lock", "freeze" -> Action.ACTION_LOCK;
+            case "unlock", "unfreeze" -> Action.ACTION_UNLOCK;
+        };
+        if (statStr == null) {
+            statStr = args.remove(0).toLowerCase();
+        }
+        if (!stats.containsKey(statStr)) {
+            sendUsageMessage(sender);  // Invalid stat or action
+            return;
+        }
+        Stat stat = stats.get(statStr);
+        EntityAvatar entity = targetPlayer.getTeamManager().getCurrentAvatarEntity();
+        Avatar avatar = entity.getAvatar();
+
+        // Get the value if the action requires it
+        try {
+            switch (action) {
+                case ACTION_LOCK:
+                    if (args.isEmpty()) {  // Lock to current value
+                        value = avatar.getFightProperty(stat.prop);
+                        break;
+                    }  // Else fall-through and lock to supplied value
+                case ACTION_SET:
+                    value = parsePercent(args.remove(0));
+                    break;
+                case ACTION_UNLOCK:
+                    break;
+            }
+        } catch (NumberFormatException ignored) {
+            CommandHandler.sendTranslatedMessage(sender, "commands.generic.invalid.statValue");
+            return;
+        } catch (IndexOutOfBoundsException ignored) {
+            sendUsageMessage(sender);
             return;
         }
 
-        String stat = args.get(0);
-        switch (stat) {
-            default:
-                CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_setstats_help_message);
-                CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_stats_help_message);
-                return;
-            case "mhp":
-                try {
-                    int health = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_MAX_HP, health);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_MAX_HP));
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_max_hp, health));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_max_hp_error);
-                    return;
-                }
+        if (!args.isEmpty()) {  // Leftover arguments!
+            sendUsageMessage(sender);
+            return;
+        }
+
+        switch (action) {
+            case ACTION_SET:
+                entity.setFightProperty(stat.prop, value);
+                entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, stat.prop));
                 break;
-            case "hp":
-                try {
-                    int health = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_CUR_HP, health);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_CUR_HP));
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_hp, health));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_hp_error);
-                    return;
-                }
+            case ACTION_LOCK:
+                avatar.getFightPropOverrides().put(stat.prop.getId(), value);
+                avatar.recalcStats();
                 break;
-            case "def":
-                try {
-                    int def = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_CUR_DEFENSE, def);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_CUR_DEFENSE));
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_def, def));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_def_error);
-                    return;
-                }
-                break;
-            case "atk":
-                try {
-                    int atk = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_CUR_ATTACK, atk);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_CUR_ATTACK));
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_atk, atk));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_atk_error);
-                    return;
-                }
-                break;
-            case "em":
-                try {
-                    int em = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_ELEMENT_MASTERY, em);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_ELEMENT_MASTERY));
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_em, em));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_em_error);
-                    return;
-                }
-                break;
-            case "er":
-                try {
-                    float er = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float erecharge = er / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_CHARGE_EFFICIENCY, erecharge);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_CHARGE_EFFICIENCY));
-                    float iger = erecharge * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_er, iger));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_er_error);
-                    return;
-                }
-                break;
-            case "crate":
-                try {
-                    float cr = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float crate = cr / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_CRITICAL, crate);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_CRITICAL));
-                    float igcrate = crate * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_cr, igcrate));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_cr_error);
-                    return;
-                }
-                break;
-            case "cdmg":
-                try {
-                    float cdmg = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float cdamage = cdmg / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_CRITICAL_HURT, cdamage);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_CRITICAL_HURT));
-                    float igcdmg = cdamage * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_cd, igcdmg));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_cd_error);
-                    return;
-                }
-                break;
-            case "epyro":
-                try {
-                    float epyro = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float pyro = epyro / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_FIRE_ADD_HURT, pyro);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_FIRE_ADD_HURT));
-                    float igpyro = pyro * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_pdb, igpyro));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_pdb_error);
-                    return;
-                }
-                break;
-            case "ecryo":
-                try {
-                    float ecryo = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float cryo = ecryo / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_ICE_ADD_HURT, cryo);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_ICE_ADD_HURT));
-                    float igcyro = cryo * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_cdb, igcyro));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_cdb_error);
-                    return;
-                }
-                break;
-            case "ehydro":
-                try {
-                    float ehydro = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float hydro = ehydro / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_WATER_ADD_HURT, hydro);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_WATER_ADD_HURT));
-                    float ighydro = hydro * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_hdb, ighydro));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_hdb_error);
-                    return;
-                }
-                break;
-            case "eanemo":
-                try {
-                    float eanemo = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float anemo = eanemo / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_WIND_ADD_HURT, anemo);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_WIND_ADD_HURT));
-                    float iganemo = anemo * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_adb, iganemo));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_adb_error);
-                    return;
-                }
-                break;
-            case "egeo":
-                try {
-                    float egeo = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float geo = egeo / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_ROCK_ADD_HURT, geo);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_ROCK_ADD_HURT));
-                    float iggeo = geo * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_gdb, iggeo));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_gdb_error);
-                    return;
-                }
-                break;
-            case "ethunder":
-            case "eelec":
-                try {
-                    float eelec = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float elec = eelec / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_ELEC_ADD_HURT, elec);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_ELEC_ADD_HURT));
-                    float igelec = elec * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_edb, igelec));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_edb_error);
-                    return;
-                }
-                break;
-            case "ephys":
-                try {
-                    float ephys = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float phys = ephys / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_PHYSICAL_ADD_HURT, phys);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_PHYSICAL_ADD_HURT));
-                    float igphys = phys * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_physdb, igphys));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_physdb_error);
-                    return;
-                }
-                break;
-            case "edend":
-                try {
-                    float edend = Integer.parseInt(args.get(1));
-                    EntityAvatar entity = sender.getTeamManager().getCurrentAvatarEntity();
-                    float dend = edend / 10000;
-                    entity.setFightProperty(FightProperty.FIGHT_PROP_GRASS_ADD_HURT, dend);
-                    entity.getWorld().broadcastPacket(new PacketEntityFightPropUpdateNotify(entity, FightProperty.FIGHT_PROP_GRASS_ADD_HURT));
-                    float igdend = dend * 100;
-                    CommandHandler.sendMessage(sender, String.format(Grasscutter.getLanguage().SetStats_set_ddb, igdend));
-                } catch (NumberFormatException ignored) {
-                    CommandHandler.sendMessage(sender, Grasscutter.getLanguage().SetStats_set_ddb_error);
-                    return;
-                }
+            case ACTION_UNLOCK:
+                avatar.getFightPropOverrides().remove(stat.prop.getId());
+                avatar.recalcStats();
                 break;
         }
+
+        // Report action
+        if (FightProperty.isPercentage(stat.prop)) {
+            valueStr = String.format("%.1f%%", value * 100f);
+        } else {
+            valueStr = String.format("%.0f", value);
+        }
+        if (targetPlayer == sender) {
+            CommandHandler.sendTranslatedMessage(sender, action.messageKeySelf, stat.name, valueStr);
+        } else {
+            String uidStr = targetPlayer.getAccount().getId();
+            CommandHandler.sendTranslatedMessage(sender, action.messageKeyOther, stat.name, uidStr, valueStr);
+        }
+        return;
     }
 }
